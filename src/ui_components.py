@@ -506,6 +506,21 @@ class RaceProgressBarComponent(BaseComponent):
         self._mouse_x: float = 0
         self._mouse_y: float = 0
         
+    def set_race_data(self, 
+                      total_frames: int, 
+                      total_laps: int,
+                      events: List[dict]):
+        """
+        set the race data for the progress bar so the calc for markers can be done once time
+        
+        - total_frames: Total number of frames in the race
+        - total_laps: Total number of laps in the race
+        - events: List of event dictionaries with keys
+        """
+        self._total_frames = max(1, total_frames)
+        self._total_laps = total_laps or 1
+        self._events = sorted(events, key=lambda e: e.get("frame", 0))
+        
 # Build track geometry from example lap telemetry
 
 def build_track_from_example_lap(example_lap, track_width=200):

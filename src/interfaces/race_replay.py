@@ -479,29 +479,16 @@ class F1RaceReplayWindow(arcade.Window):
                                 except (TypeError, ValueError):
                                     continue
 
-                        def _parse_gap_to_leader(raw_value, row_position):
+                        def _parse_timing_delta(raw_value, row_position=None):
+                            leader_row = str(row_position or "") == "1"
                             if pd.isna(raw_value):
-                                return 0.0 if str(row_position or "") == "1" else None
+                                return 0.0 if leader_row else None
                             gap_text = str(raw_value).strip()
                             if not gap_text:
-                                return 0.0 if str(row_position or "") == "1" else None
+                                return 0.0 if leader_row else None
                             upper_text = gap_text.upper()
                             if upper_text.startswith("LAP") or upper_text.endswith(" L") or upper_text.endswith("L"):
-                                return 0.0 if str(row_position or "") == "1" else None
-                            gap_td = ffutils.to_timedelta(gap_text)
-                            if gap_td is not None:
-                                return float(gap_td.total_seconds())
-                            return None
-
-                        def _parse_interval_to_ahead(raw_value):
-                            if pd.isna(raw_value):
-                                return None
-                            gap_text = str(raw_value).strip()
-                            if not gap_text:
-                                return None
-                            upper_text = gap_text.upper()
-                            if upper_text.startswith("LAP") or upper_text.endswith(" L") or upper_text.endswith("L"):
-                                return None
+                                return 0.0 if leader_row else None
                             gap_td = ffutils.to_timedelta(gap_text)
                             if gap_td is not None:
                                 return float(gap_td.total_seconds())
@@ -565,7 +552,7 @@ class F1RaceReplayWindow(arcade.Window):
                                 if not interval_quality_rows.empty:
                                     scored_intervals = []
                                     for _, cand_row in interval_quality_rows.iterrows():
-                                        cand_interval_s = _parse_interval_to_ahead(
+                                        cand_interval_s = _parse_timing_delta(
                                             cand_row.get("IntervalToPositionAhead")
                                         )
                                         if cand_interval_s is None:
@@ -583,10 +570,10 @@ class F1RaceReplayWindow(arcade.Window):
                                             interval_chain_reliable = (
                                                 max(close_intervals) - min(close_intervals) <= 1.0
                                             )
-                                gap_s = _parse_gap_to_leader(
+                                gap_s = _parse_timing_delta(
                                     matched_stream_row.get("GapToLeader"), matched_position
                                 )
-                                interval_s = _parse_interval_to_ahead(
+                                interval_s = _parse_timing_delta(
                                     matched_stream_row.get("IntervalToPositionAhead")
                                 )
                                 if gap_s is None and interval_s is None:
@@ -1508,4 +1495,3 @@ class F1RaceReplayWindow(arcade.Window):
             print("Stopping telemetry stream server...")
             self.telemetry_stream.stop()
         super().close()
-

@@ -23,6 +23,7 @@ import time
 import numpy as np
 import matplotlib
 matplotlib.use("QtAgg")
+import matplotlib.lines as mlines
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -241,8 +242,56 @@ def _entry_has_gap_discontinuity(entry, pit_threshold, sc_vsc_laps):
 def _terminal_status_display_text(status):
     status_text = str(status or "").strip()
     if not status_text or status_text.lower() == "retired":
-        return "Retired due to DNF"
+        return "Retired (DNF)"
     return status_text
+
+
+class _OverlayBlitManager:
+    """Manage a tiny animated overlay layer for hover crosshair and tooltip."""
+
+    def __init__(self, canvas):
+        self.canvas = canvas
+        self.enabled = bool(getattr(canvas, "supports_blit", False))
+        self._artists = []
+        self._background = None
+        self._cid = canvas.mpl_connect("draw_event", self._on_draw)
+
+    def set_artists(self, artists):
+        self._artists = [artist for artist in artists if artist is not None]
+        if self.enabled:
+            for artist in self._artists:
+                artist.set_animated(True)
+
+    def reset(self):
+        self._background = None
+
+    def _on_draw(self, event):
+        if not self.enabled:
+            return
+        try:
+            self._background = self.canvas.copy_from_bbox(self.canvas.figure.bbox)
+            self._draw_artists()
+            self.canvas.blit(self.canvas.figure.bbox)
+        except Exception:
+            self._background = None
+
+    def _draw_artists(self):
+        fig = self.canvas.figure
+        for artist in self._artists:
+            if artist is not None and artist.get_visible():
+                fig.draw_artist(artist)
+
+    def update(self):
+        if not self.enabled or self._background is None:
+            return False
+        try:
+            self.canvas.restore_region(self._background)
+            self._draw_artists()
+            self.canvas.blit(self.canvas.figure.bbox)
+            return True
+        except Exception:
+            self._background = None
+            return False
 
 
 class LapTimeChartWindow(PitWallWindow):
@@ -306,16 +355,38 @@ class LapTimeChartWindow(PitWallWindow):
         # Crosshair debounce
         self._last_crosshair_state = None
         self._hover_point_key = None
-        self._last_rendered_terminal_signature = ()
+        self._last_rendered_visibility_signature = ()
+        self._chart_dirty = False
+        self._render_in_flight = False
+        self._last_render_monotonic = 0.0
+        self._latest_stream_version = 0
+        self._last_rendered_stream_version = 0
+        self._resize_active = False
+        self._resize_started_monotonic = None
+        self._hover_cache_dirty = False
+        self._debug_perf_enabled = False
+        self._perf_stats = {
+            "full_redraw_count": 0,
+            "coalesced_live_updates": 0,
+            "redraw_durations_ms": [],
+            "resize_freeze_ms": 0.0,
+        }
+        self._overlay_blit = None
 
         super().__init__()
 
         self._deferred_redraw_timer = QTimer(self)
         self._deferred_redraw_timer.setSingleShot(True)
         self._deferred_redraw_timer.timeout.connect(self._flush_deferred_redraw)
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self._flush_live_render)
         self._resize_refresh_timer = QTimer(self)
         self._resize_refresh_timer.setSingleShot(True)
         self._resize_refresh_timer.timeout.connect(self._refresh_after_resize)
+        self._view_refresh_timer = QTimer(self)
+        self._view_refresh_timer.setSingleShot(True)
+        self._view_refresh_timer.timeout.connect(self._refresh_after_view_change)
 
         self.setWindowTitle("F1 Race Replay - Lap Time & Gap Evolution")
         self.setGeometry(120, 120, 1000, 600)
@@ -344,11 +415,37 @@ class LapTimeChartWindow(PitWallWindow):
                 return float(value)
         return None
 
+    def _entry_completion_visibility_time_s(self, entry):
+        if not entry or entry.get("is_terminal_lap"):
+            return None
+        for key in ("replay_line_time_s", "replay_end_time_s"):
+            value = entry.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+        if entry.get("time_source") == "frame_backfill" or entry.get("source") == "derived":
+            for key in ("line_time_s", "end_time_s"):
+                value = entry.get(key)
+                if isinstance(value, (int, float)):
+                    return float(value)
+        return None
+
+    def _is_normal_entry_visible(self, entry):
+        if not entry or entry.get("is_terminal_lap"):
+            return False
+        visible_at_s = self._entry_completion_visibility_time_s(entry)
+        if visible_at_s is not None and isinstance(self._current_time_s, (int, float)):
+            return self._current_time_s >= visible_at_s
+        lap = entry.get("lap")
+        if isinstance(lap, (int, float)):
+            lap_int = int(lap)
+            if self._total_laps and lap_int >= int(self._total_laps):
+                return False
+            return self._leader_lap > lap_int
+        return False
+
     def _is_terminal_entry_visible(self, entry, include_final=False):
         if not entry or not entry.get("is_terminal_lap"):
             return False
-        if include_final:
-            return True
         visible_at_s = self._terminal_entry_visibility_time_s(entry)
         if visible_at_s is not None and isinstance(self._current_time_s, (int, float)):
             return self._current_time_s >= visible_at_s
@@ -357,29 +454,29 @@ class LapTimeChartWindow(PitWallWindow):
             return self._leader_lap > int(lap)
         return False
 
-    def _terminal_visibility_signature(self):
+    def _visible_entry_signature(self):
         if not self._lap_times:
             return ()
-        include_final = bool(self._total_laps and self._leader_lap >= self._total_laps)
         visible = []
         for code, entries in self._lap_times.items():
             for entry in entries:
-                if self._is_terminal_entry_visible(entry, include_final=include_final):
-                    visible.append((code, int(entry.get("lap", -1))))
+                if entry.get("is_terminal_lap"):
+                    if self._is_terminal_entry_visible(entry, include_final=False):
+                        visible.append((code, int(entry.get("lap", -1)), "terminal"))
+                elif self._is_normal_entry_visible(entry):
+                    visible.append((code, int(entry.get("lap", -1)), "lap"))
         return tuple(sorted(visible))
-
-    def _completed_lap_cutoff(self):
-        include_final = bool(self._total_laps and self._leader_lap >= self._total_laps)
-        if include_final:
-            return max(0, int(self._leader_lap))
-        return max(0, int(self._leader_lap) - 1)
         
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._reposition_overlays()
         if getattr(self, "_has_ever_drawn", False):
-            self._resize_refresh_timer.start(30)
+            if not self._resize_active:
+                self._resize_active = True
+                self._resize_started_monotonic = time.monotonic()
+            self._view_refresh_timer.stop()
+            self._resize_refresh_timer.start(140)
 
     def _reposition_overlays(self):
         """Keep the help overlay centered."""
@@ -391,10 +488,63 @@ class LapTimeChartWindow(PitWallWindow):
     def _refresh_after_resize(self):
         if not hasattr(self, "_canvas") or not getattr(self, "_has_ever_drawn", False):
             return
-        self._canvas.draw()
-        self._rebuild_legend_hitboxes()
+        if self._resize_active and self._resize_started_monotonic is not None:
+            self._perf_stats["resize_freeze_ms"] += (time.monotonic() - self._resize_started_monotonic) * 1000.0
+        self._resize_active = False
+        self._resize_started_monotonic = None
+        self._overlay_reset()
+        self._mark_chart_dirty()
+        self._request_live_render(immediate=True)
+
+    def _refresh_after_view_change(self):
+        if self._resize_active or not getattr(self, "_has_ever_drawn", False):
+            return
+        self._hover_cache_dirty = False
         self._rebuild_hover_screen_cache()
         self._refresh_hover_from_cursor()
+
+    def _invalidate_hover_screen_cache(self, refresh_delay_ms=80):
+        self._hover_cache_dirty = True
+        self._view_refresh_timer.start(refresh_delay_ms)
+
+    def _overlay_reset(self):
+        if self._overlay_blit is not None:
+            self._overlay_blit.reset()
+
+    def _overlay_update(self):
+        if self._overlay_blit is not None and self._overlay_blit.update():
+            return
+        self._canvas.draw_idle()
+
+    def _mark_chart_dirty(self):
+        self._chart_dirty = True
+
+    def _target_render_interval_ms(self):
+        if self._hover_legend_code is not None:
+            return 280
+        if self._is_interaction_hot():
+            return 100
+        return 50
+
+    def _request_live_render(self, immediate=False):
+        self._mark_chart_dirty()
+        if self._resize_active:
+            return
+        if immediate:
+            if self._render_timer.isActive():
+                self._render_timer.stop()
+            self._flush_live_render()
+            return
+        interval_ms = self._target_render_interval_ms()
+        elapsed_ms = (time.monotonic() - self._last_render_monotonic) * 1000.0 if self._last_render_monotonic else None
+        if elapsed_ms is None or elapsed_ms >= interval_ms:
+            delay_ms = 0
+        else:
+            delay_ms = max(0, int(interval_ms - elapsed_ms))
+        if self._render_timer.isActive():
+            self._perf_stats["coalesced_live_updates"] += 1
+            return
+        self._render_timer.start(delay_ms)
 
     def _gap_ref_s(self, entry):
         if not entry:
@@ -606,6 +756,7 @@ class LapTimeChartWindow(PitWallWindow):
             self._canvas.sizePolicy().horizontalPolicy(),
             self._canvas.sizePolicy().verticalPolicy(),
         )
+        self._overlay_blit = _OverlayBlitManager(self._canvas)
         root.addWidget(self._canvas, stretch=1)
 
         # Connect mouse events: crosshair, legend/line pick, drag-pan
@@ -698,6 +849,7 @@ class LapTimeChartWindow(PitWallWindow):
     # Telemetry handling
 
     def on_telemetry_data(self, data):
+        self._latest_stream_version += 1
         frame = data.get("frame")
         if not frame:
             return
@@ -738,7 +890,7 @@ class LapTimeChartWindow(PitWallWindow):
             self._user_xlim = None
             self._user_ylim = None
             self._view_state_by_mode.clear()
-            self._last_rendered_terminal_signature = ()
+            self._last_rendered_visibility_signature = ()
 
         # Ingest pre-computed data from server
         if "lap_times" in data:
@@ -755,22 +907,25 @@ class LapTimeChartWindow(PitWallWindow):
         # Update driver list
         self._refresh_driver_list(drivers)
 
-        terminal_visibility_changed = (
-            self._terminal_visibility_signature() != self._last_rendered_terminal_signature
+        visible_entries_changed = (
+            self._visible_entry_signature() != self._last_rendered_visibility_signature
         )
 
         # Redraw when leader crosses a new lap, terminal state becomes visible,
         # or the chart needs a full rebuild.
-        if self._leader_lap > self._last_drawn_lap or self._needs_full_redraw or terminal_visibility_changed:
+        if self._leader_lap > self._last_drawn_lap or self._needs_full_redraw or visible_entries_changed:
             self._last_drawn_lap = self._leader_lap
             force_redraw = self._needs_full_redraw
             self._needs_full_redraw = False
-            if not force_redraw and (self._is_interaction_hot() or self._hover_legend_code is not None):
-                self._pending_live_redraw = True
-                self._schedule_deferred_redraw()
-            else:
+            if not self._has_ever_drawn:
                 self._pending_live_redraw = False
-                self._redraw()
+                self._redraw_now()
+            elif force_redraw and not self._resize_active:
+                self._pending_live_redraw = False
+                self._request_live_render(immediate=True)
+            else:
+                self._pending_live_redraw = True
+                self._request_live_render(immediate=False)
 
     def _refresh_driver_list(self, drivers):
         incoming = sorted(drivers.keys())
@@ -799,7 +954,7 @@ class LapTimeChartWindow(PitWallWindow):
         else:
             self._focused_drivers = {text}
         self._needs_full_redraw = True
-        self._redraw()
+        self._redraw_now()
 
     def _on_ymode_changed(self, index):
         self._push_undo_state()
@@ -807,7 +962,7 @@ class LapTimeChartWindow(PitWallWindow):
         self._y_mode = _YMODE_TIME if index == 0 else _YMODE_GAP
         self._restore_view_state()
         self._needs_full_redraw = True
-        self._redraw()
+        self._redraw_now()
 
     def _save_view_state(self):
         if not getattr(self, "_has_ever_drawn", False):
@@ -860,14 +1015,14 @@ class LapTimeChartWindow(PitWallWindow):
             self._user_xlim = tuple(snapshot["xlim"])
             self._user_ylim = tuple(snapshot["ylim"])
             self._needs_full_redraw = True
-            self._redraw()
+            self._redraw_now()
             self._update_history_buttons()
             return
         self._ax.set_xlim(snapshot["xlim"])
         self._ax.set_ylim(snapshot["ylim"])
         self._set_user_view(snapshot["xlim"], snapshot["ylim"])
-        self._rebuild_hover_screen_cache()
-        self._refresh_hover_from_cursor()
+        self._overlay_reset()
+        self._invalidate_hover_screen_cache(refresh_delay_ms=30)
         self._update_history_buttons()
         self._canvas.draw_idle()
 
@@ -899,7 +1054,23 @@ class LapTimeChartWindow(PitWallWindow):
 
     def _on_pure_pace_toggled(self, state):
         self._needs_full_redraw = True
-        self._redraw()
+        self._redraw_now()
+
+    def _redraw_now(self):
+        started = time.monotonic()
+        self._render_in_flight = True
+        try:
+            self._redraw()
+            self._chart_dirty = False
+            self._last_rendered_stream_version = self._latest_stream_version
+        finally:
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            self._last_render_monotonic = time.monotonic()
+            self._render_in_flight = False
+            self._perf_stats["full_redraw_count"] += 1
+            self._perf_stats["redraw_durations_ms"].append(elapsed_ms)
+            if len(self._perf_stats["redraw_durations_ms"]) > 120:
+                self._perf_stats["redraw_durations_ms"] = self._perf_stats["redraw_durations_ms"][-120:]
 
     def _toggle_help(self):
         if self._help_overlay.isHidden():
@@ -914,6 +1085,7 @@ class LapTimeChartWindow(PitWallWindow):
     def _redraw(self):
         ax = self._ax
         self._pending_live_redraw = False
+        self._overlay_reset()
         previous_hover_legend_code = self._hover_legend_code
         previous_hover_point_key = self._hover_point_key
         ax.clear()
@@ -937,23 +1109,18 @@ class LapTimeChartWindow(PitWallWindow):
 
         focus = self._focused_drivers
 
-        # Show completed laps during replay. Terminal no-time laps become visible
-        # only once the replay has actually reached their event timestamp.
+        # Show each driver's laps only once that driver actually completes them.
+        # Terminal no-time laps remain special event markers and become visible
+        # once the replay has reached their event timestamp.
         visible_data = {}
-        lap_cutoff = self._leader_lap
-        include_final_lap = self._total_laps and self._leader_lap >= self._total_laps
-        completed_lap_cutoff = self._completed_lap_cutoff()
         for code, entries in self._lap_times.items():
-            if include_final_lap:
-                visible = [e for e in entries if e["lap"] <= lap_cutoff or e.get("is_terminal_lap")]
-            else:
-                visible = []
-                for entry in entries:
-                    if entry.get("is_terminal_lap"):
-                        if self._is_terminal_entry_visible(entry, include_final=False):
-                            visible.append(entry)
-                    elif entry["lap"] < lap_cutoff:
+            visible = []
+            for entry in entries:
+                if entry.get("is_terminal_lap"):
+                    if self._is_terminal_entry_visible(entry, include_final=False):
                         visible.append(entry)
+                elif self._is_normal_entry_visible(entry):
+                    visible.append(entry)
             if visible:
                 visible_data[code] = visible
 
@@ -961,7 +1128,30 @@ class LapTimeChartWindow(PitWallWindow):
             self._canvas.draw_idle()
             return
 
+        completed_lap_cutoff = max(
+            (
+                int(entry["lap"])
+                for entries in visible_data.values()
+                for entry in entries
+                if not entry.get("is_terminal_lap")
+            ),
+            default=0,
+        )
+
         pure_pace = self._pure_pace_cb.isChecked()
+        # Gap mode should stay completed-lap based for rendering, but the
+        # fallback/interpolation math can safely use the full session-known
+        # lap set as anchor points. This prevents completed laps from popping
+        # in late simply because their next official anchor is only revealed
+        # on the chart one replay lap later.
+        gap_source_data = {}
+        for code, entries in self._lap_times.items():
+            source_entries = [
+                e for e in entries
+                if not e.get("is_terminal_lap")
+            ]
+            if source_entries:
+                gap_source_data[code] = source_entries
         sc_vsc_laps = set()
         
         # ── 1. Safety Car / VSC shaded zones ──
@@ -1006,11 +1196,11 @@ class LapTimeChartWindow(PitWallWindow):
         # data is inconsistent.
         lap_entry_lookup = {
             code: {e["lap"]: e for e in entries if e["time_s"] > 0}
-            for code, entries in visible_data.items()
+            for code, entries in gap_source_data.items()
         }
         leader_refs = {}
         if self._is_gap_mode():
-            for lap in sorted({e["lap"] for entries in visible_data.values() for e in entries}):
+            for lap in sorted({e["lap"] for entries in gap_source_data.values() for e in entries}):
                 official_candidates = []
                 candidates = []
                 for code, lap_entries in lap_entry_lookup.items():
@@ -1041,7 +1231,7 @@ class LapTimeChartWindow(PitWallWindow):
         gap_overrides = {}
         gap_suppressed_laps = set()
         if self._is_gap_mode():
-            for code, entries in visible_data.items():
+            for code, entries in gap_source_data.items():
                 sorted_entries = sorted(entries, key=lambda item: item["lap"])
                 anchors = []
                 for entry in sorted_entries:
@@ -1116,7 +1306,7 @@ class LapTimeChartWindow(PitWallWindow):
                         continue
                     gap_adjustments[(code, lap)] = adjusted_val
             gap_override_threshold = 5.0
-            for code, entries in visible_data.items():
+            for code, entries in gap_source_data.items():
                 sorted_entries = sorted(entries, key=lambda item: item["lap"])
                 prev_gap = None
                 prev_gap_lap = None
@@ -1225,6 +1415,14 @@ class LapTimeChartWindow(PitWallWindow):
 
         # Store line references for picking
         driver_stints_text = {}
+        pending_pit_markers = []
+        focused_hud_rows = min(len(focus), 4) if focus else 0
+        pit_marker_y_by_focus_rows = {
+            1: 0.88,
+            2: 0.83,
+            3: 0.78,
+            4: 0.73,
+        }
         display_y_vals = []
         all_axis_y_vals = []
 
@@ -1430,19 +1628,13 @@ class LapTimeChartWindow(PitWallWindow):
             # Only show when a driver is focused (in All Drivers view,
             # dozens of pit-lap outlier points create noise)
             if pit_laps and focus and is_focused and not pure_pace:
-                pit_marker_y_frac = 0.87 if len(focus) > 1 else 0.95
-                for pl in pit_laps:
-                    ax.axvline(
-                        pl, color=colour, alpha=0.55,
-                        linewidth=1.2, linestyle=":",
-                        zorder=zorder - 2,
-                    )
-                    ax.scatter(
-                        pl, pit_marker_y_frac, marker="x",
-                        color=colour, alpha=0.9, s=46,
-                        zorder=zorder, linewidths=1.8,
-                        transform=ax.get_xaxis_transform()
-                    )
+                pending_pit_markers.append({
+                    "code": code,
+                    "laps": list(pit_laps),
+                    "colour": colour,
+                    "zorder": zorder,
+                    "y_frac": pit_marker_y_by_focus_rows.get(focused_hud_rows, 0.87),
+                })
 
             if terminal_marker_entries and focus and is_focused and not pure_pace:
                 for item in terminal_marker_entries:
@@ -1466,7 +1658,6 @@ class LapTimeChartWindow(PitWallWindow):
         # ── 4b. HUD Statistics (prepared for drawing at the end) ──
         hud_handles, hud_labels = [], []
         if focus and len(focus) <= 4:
-            import matplotlib.lines as mlines
             for code in sorted(focus):
                 if code not in visible_data: continue
                 # Calculate best lap and avg true pace
@@ -1542,7 +1733,7 @@ class LapTimeChartWindow(PitWallWindow):
                     "is_pit_entry": point.get("is_pit_entry", False),
                     "is_approx": False,
                     "is_terminal_no_time": True,
-                    "status": point.get("status", "Retired due to DNF"),
+                    "status": point.get("status", "Retired (DNF)"),
                 })
 
         # X-axis
@@ -1598,6 +1789,24 @@ class LapTimeChartWindow(PitWallWindow):
                 facecolor=_BG, edgecolor="#555555", labelcolor=_TEXT
             )
             hud_leg.set_zorder(50)
+        else:
+            hud_leg = None
+
+        if pending_pit_markers:
+            for marker_info in pending_pit_markers:
+                pit_marker_y_frac = marker_info["y_frac"]
+                for pl in marker_info["laps"]:
+                    ax.axvline(
+                        pl, color=marker_info["colour"], alpha=0.55,
+                        linewidth=1.2, linestyle=":",
+                        zorder=marker_info["zorder"] - 2,
+                    )
+                    ax.scatter(
+                        pl, pit_marker_y_frac, marker="x",
+                        color=marker_info["colour"], alpha=0.9, s=46,
+                        zorder=marker_info["zorder"], linewidths=1.8,
+                        transform=ax.get_xaxis_transform()
+                    )
 
         # Setup crosshair annotation (hidden by default)
         self._annot = ax.annotate(
@@ -1613,6 +1822,8 @@ class LapTimeChartWindow(PitWallWindow):
         # Crosshair lines
         self._crosshair_v = ax.axvline(0, color="#555555", linewidth=0.5, linestyle="--", visible=False, zorder=99)
         self._crosshair_h = ax.axhline(0, color="#555555", linewidth=0.5, linestyle="--", visible=False, zorder=99)
+        if self._overlay_blit is not None:
+            self._overlay_blit.set_artists([self._annot, self._crosshair_v, self._crosshair_h])
 
 
         # Store home limits for zoom clamping
@@ -1651,11 +1862,16 @@ class LapTimeChartWindow(PitWallWindow):
         if self._user_ylim is not None:
             ax.set_ylim(self._user_ylim)
 
+        self._hover_cache_dirty = False
         self._rebuild_hover_screen_cache()
         self._has_ever_drawn = True
         self._last_crosshair_state = None
-        self._last_rendered_terminal_signature = self._terminal_visibility_signature()
-        if not self._restore_hover_point(previous_hover_point_key):
+        self._last_rendered_visibility_signature = self._visible_entry_signature()
+        legend_hover_restored = (
+            previous_hover_legend_code is not None
+            and self._hover_legend_code == previous_hover_legend_code
+        )
+        if not legend_hover_restored and not self._restore_hover_point(previous_hover_point_key):
             self._refresh_hover_from_cursor()
         self._canvas.draw_idle()
 
@@ -1758,7 +1974,8 @@ class LapTimeChartWindow(PitWallWindow):
         self._ax.set_ylim(new_y_lo, new_y_hi)
         self._set_user_view((new_x_lo, new_x_hi), (new_y_lo, new_y_hi))
         self._mark_interaction_activity()
-        self._rebuild_hover_screen_cache()
+        self._overlay_reset()
+        self._invalidate_hover_screen_cache()
         self._canvas.draw_idle()
 
     def _reset_view(self):
@@ -1769,7 +1986,7 @@ class LapTimeChartWindow(PitWallWindow):
         self._user_ylim = None
         self._view_state_by_mode.pop(self._y_mode, None)
         self._canvas.unsetCursor()
-        self._redraw()
+        self._redraw_now()
 
     def _on_mouse_move(self, event):
         """Crosshair + tooltip on hover, and pixel-based drag-to-pan."""
@@ -1789,7 +2006,7 @@ class LapTimeChartWindow(PitWallWindow):
                 if self._crosshair_h:
                     self._crosshair_h.set_visible(False)
                 self._last_crosshair_state = None
-                self._canvas.draw_idle()
+                self._overlay_update()
             return
 
         if self._is_over_legend(event):
@@ -1833,7 +2050,7 @@ class LapTimeChartWindow(PitWallWindow):
                 self._ax.set_ylim(new_y_lo, new_y_hi)
                 self._set_user_view((new_x_lo, new_x_hi), (new_y_lo, new_y_hi))
                 self._mark_interaction_activity()
-                self._rebuild_hover_screen_cache()
+                self._invalidate_hover_screen_cache()
                 self._last_pan_draw_ts = now
                 self._canvas.draw_idle()
                 return
@@ -1846,7 +2063,7 @@ class LapTimeChartWindow(PitWallWindow):
                     self._crosshair_v.set_visible(False)
                 if self._crosshair_h:
                     self._crosshair_h.set_visible(False)
-                self._canvas.draw_idle()
+                self._overlay_update()
             return
 
         hover_points = getattr(self, "_cached_hover_screen_points", None)
@@ -1932,10 +2149,21 @@ class LapTimeChartWindow(PitWallWindow):
             return
         if self._hover_legend_code is not None:
             self._apply_legend_hover_style(self._hover_legend_code, active=False)
+        entering_hover = code is not None and self._hover_legend_code is None
+        leaving_hover = code is None and self._hover_legend_code is not None
         self._hover_legend_code = code
+        if entering_hover:
+            if self._render_timer.isActive():
+                self._render_timer.stop()
+            if self._deferred_redraw_timer.isActive():
+                self._deferred_redraw_timer.stop()
         if code is not None:
             self._apply_legend_hover_style(code, active=True)
         self._canvas.draw_idle()
+        if entering_hover and (self._chart_dirty or self._pending_live_redraw or self._last_rendered_stream_version != self._latest_stream_version):
+            self._request_live_render(immediate=False)
+        if leaving_hover and (self._chart_dirty or self._pending_live_redraw or self._last_rendered_stream_version != self._latest_stream_version):
+            self._request_live_render(immediate=False)
 
     def _apply_legend_hover_style(self, code, active):
         plot_line = self._plot_line_by_code.get(code)
@@ -2100,7 +2328,7 @@ class LapTimeChartWindow(PitWallWindow):
             self._crosshair_h.set_ydata([info["val"]])
             self._crosshair_h.set_visible(True)
 
-        self._canvas.draw_idle()
+        self._overlay_update()
 
     def _hide_hover(self):
         changed = False
@@ -2119,12 +2347,13 @@ class LapTimeChartWindow(PitWallWindow):
         self._last_crosshair_state = None
         self._hover_point_key = None
         if changed:
-            self._canvas.draw_idle()
+            self._overlay_update()
 
     def _rebuild_hover_screen_cache(self):
         hover_candidates = getattr(self, "_cached_hover_candidates", None)
         if not hover_candidates or not hasattr(self, "_ax"):
             self._cached_hover_screen_points = []
+            self._hover_cache_dirty = False
             return
         transform = self._ax.transData.transform
         screen_points = []
@@ -2135,9 +2364,15 @@ class LapTimeChartWindow(PitWallWindow):
                 continue
             screen_points.append((float(px), float(py), info))
         self._cached_hover_screen_points = screen_points
+        self._hover_cache_dirty = False
 
     def _refresh_hover_from_cursor(self):
-        if not hasattr(self, "_canvas") or not getattr(self, "_has_ever_drawn", False):
+        if (
+            not hasattr(self, "_canvas")
+            or not getattr(self, "_has_ever_drawn", False)
+            or self._hover_cache_dirty
+            or self._resize_active
+        ):
             return
         local_pos = self._canvas.mapFromGlobal(QCursor.pos())
         if not self._canvas.rect().contains(local_pos):
@@ -2164,13 +2399,33 @@ class LapTimeChartWindow(PitWallWindow):
         self._deferred_redraw_timer.start(110 if self._hover_legend_code is not None else 140)
 
     def _flush_deferred_redraw(self):
-        if not self._pending_live_redraw:
+        if self._pending_live_redraw:
+            self._request_live_render(immediate=False)
+
+    def _flush_live_render(self):
+        if not self._chart_dirty or self._resize_active or self._render_in_flight:
             return
         if self._is_interaction_hot():
             self._schedule_deferred_redraw()
             return
+        self._render_in_flight = True
         self._pending_live_redraw = False
-        self._redraw()
+        started = time.monotonic()
+        stream_version = self._latest_stream_version
+        try:
+            self._redraw()
+            self._chart_dirty = False
+            self._last_rendered_stream_version = stream_version
+        finally:
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            self._last_render_monotonic = time.monotonic()
+            self._render_in_flight = False
+            self._perf_stats["full_redraw_count"] += 1
+            self._perf_stats["redraw_durations_ms"].append(elapsed_ms)
+            if len(self._perf_stats["redraw_durations_ms"]) > 120:
+                self._perf_stats["redraw_durations_ms"] = self._perf_stats["redraw_durations_ms"][-120:]
+        if self._chart_dirty or self._last_rendered_stream_version != self._latest_stream_version:
+            self._request_live_render(immediate=False)
 
     def _widget_pos_to_data(self, pointf):
         if pointf is None:
@@ -2272,7 +2527,8 @@ class LapTimeChartWindow(PitWallWindow):
         ax.set_xlim(new_x_lo, new_x_hi)
         ax.set_ylim(new_y_lo, new_y_hi)
         self._set_user_view((new_x_lo, new_x_hi), (new_y_lo, new_y_hi))
-        self._rebuild_hover_screen_cache()
+        self._overlay_reset()
+        self._invalidate_hover_screen_cache()
         self._canvas.draw_idle()
 
     def _on_button_press(self, event):
@@ -2298,6 +2554,8 @@ class LapTimeChartWindow(PitWallWindow):
             self._pan_active = False
             self._last_pan_draw_ts = 0.0
             self._canvas.unsetCursor()
+            if self._hover_cache_dirty:
+                self._view_refresh_timer.start(30)
 
     def _on_pick(self, event):
         """Toggle isolation when clicking a driver's legend."""
@@ -2333,7 +2591,7 @@ class LapTimeChartWindow(PitWallWindow):
             self._driver_combo.blockSignals(False)
             
             self._needs_full_redraw = True
-            self._redraw()
+            self._redraw_now()
             QTimer.singleShot(0, self._refresh_hover_from_cursor)
 
     def eventFilter(self, obj, event):
@@ -2408,7 +2666,7 @@ class LapTimeChartWindow(PitWallWindow):
         if key == Qt.Key.Key_I:
             self._legend_visible = not self._legend_visible
             self._needs_full_redraw = True
-            self._redraw()
+            self._redraw_now()
             event.accept()
             return True
         if self._canvas.hasFocus():

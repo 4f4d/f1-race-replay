@@ -416,6 +416,10 @@ class F1RaceReplayWindow(arcade.Window):
                                     entry["end_time_s"] = fb_entry["end_time_s"]
                                 if entry.get("line_time_s") is None and fb_entry.get("end_time_s") is not None:
                                     entry["line_time_s"] = fb_entry["end_time_s"]
+                                if fb_entry.get("end_time_s") is not None:
+                                    replay_end = float(fb_entry["end_time_s"])
+                                    entry["replay_end_time_s"] = replay_end
+                                    entry["replay_line_time_s"] = replay_end
                                 if fb_entry.get("start_time_s") is not None:
                                     entry["start_time_s"] = fb_entry["start_time_s"]
                             if (fb_entry.get("is_pit_affected") or fb_entry.get("is_pit")) and not entry.get("is_pit_affected"):
@@ -437,6 +441,7 @@ class F1RaceReplayWindow(arcade.Window):
                     F1RaceReplayWindow._attach_replay_aligned_lap_times(
                         result,
                         replay_time_offset_s,
+                        classified_fallback,
                     )
                     try:
                         _, stream_data, _ = ffapi._extended_timing_data(session.api_path)
@@ -725,16 +730,17 @@ class F1RaceReplayWindow(arcade.Window):
 
                                 status_text = str(res_row.get("Status", "")).strip()
                                 classified_pos = str(res_row.get("ClassifiedPosition", "")).strip()
-                                is_terminal_retirement = (
-                                    classified_pos == "R"
-                                    or (
-                                        status_text
-                                        and status_text not in {"Finished", "Lapped"}
-                                        and not status_text.startswith("+")
-                                    )
-                                )
-                                if not is_terminal_retirement:
-                                    continue
+
+                                def _is_terminal_event_entry(entry):
+                                    if entry is None:
+                                        return False
+                                    if entry.get("time_s", -1.0) <= 0:
+                                        return True
+                                    if entry.get("fastf1_generated"):
+                                        return True
+                                    if not entry.get("is_accurate", True):
+                                        return True
+                                    return False
 
                                 code_entries = result.setdefault(code, [])
                                 completed_entry = next(
@@ -745,11 +751,7 @@ class F1RaceReplayWindow(arcade.Window):
                                     (
                                         e for e in code_entries
                                         if e.get("lap") == terminal_lap + 1
-                                        and (
-                                            e.get("time_s", -1.0) <= 0
-                                            or e.get("fastf1_generated")
-                                            or not e.get("is_accurate", True)
-                                        )
+                                        and _is_terminal_event_entry(e)
                                     ),
                                     None,
                                 )
@@ -773,6 +775,16 @@ class F1RaceReplayWindow(arcade.Window):
                                         or terminal_time_s <= completed_time_s
                                     ):
                                         terminal_entry = None
+
+                                has_follow_on_terminal_event = terminal_entry is not None
+                                has_same_lap_terminal_event = (
+                                    not has_follow_on_terminal_event
+                                    and _is_terminal_event_entry(completed_entry)
+                                )
+                                if classified_pos != "R":
+                                    continue
+                                if not (has_follow_on_terminal_event or has_same_lap_terminal_event):
+                                    continue
 
                                 if terminal_entry is None:
                                     terminal_entry = completed_entry
@@ -804,10 +816,14 @@ class F1RaceReplayWindow(arcade.Window):
                                     )
                                 if terminal_event_time_s is not None:
                                     terminal_entry["terminal_event_time_s"] = terminal_event_time_s
-                                if classified_pos == "R":
+                                if (
+                                    not status_text
+                                    or status_text in {"Finished", "Lapped"}
+                                    or status_text.startswith("+")
+                                ):
                                     terminal_entry["result_status"] = "Retired"
                                 else:
-                                    terminal_entry["result_status"] = status_text or "Retired"
+                                    terminal_entry["result_status"] = status_text
                     except Exception as e:
                         print(f"Warning: result-status enrichment failed, continuing without terminal/result metadata: {e}")
                     return F1RaceReplayWindow._classify_lap_entries(result, official_data=True)
@@ -845,24 +861,43 @@ class F1RaceReplayWindow(arcade.Window):
         return float(diffs[len(diffs) // 2])
 
     @staticmethod
-    def _attach_replay_aligned_lap_times(result, replay_time_offset_s):
-        if replay_time_offset_s is None:
-            return
-        for entries in result.values():
+    def _attach_replay_aligned_lap_times(result, replay_time_offset_s, fallback_result=None):
+        fallback_by_code = {}
+        if fallback_result:
+            fallback_by_code = {
+                code: {
+                    entry.get("lap"): entry
+                    for entry in entries
+                    if isinstance(entry.get("end_time_s"), (int, float))
+                }
+                for code, entries in fallback_result.items()
+            }
+
+        for code, entries in result.items():
+            fallback_entries = fallback_by_code.get(code, {})
             for entry in entries:
+                if entry.get("time_source") == "frame_backfill":
+                    fb_entry = fallback_entries.get(entry.get("lap"))
+                    if fb_entry is not None and isinstance(fb_entry.get("end_time_s"), (int, float)):
+                        replay_end = float(fb_entry["end_time_s"])
+                        entry.setdefault("replay_line_time_s", replay_end)
+                        entry.setdefault("replay_end_time_s", replay_end)
+
+                if replay_time_offset_s is None:
+                    continue
+
                 for src_key, dst_key in (
                     ("line_time_s", "replay_line_time_s"),
                     ("end_time_s", "replay_end_time_s"),
                 ):
+                    if isinstance(entry.get(dst_key), (int, float)):
+                        continue
                     src_val = entry.get(src_key)
                     if not isinstance(src_val, (int, float)):
                         continue
-                    if entry.get("time_source") == "frame_backfill":
-                        entry[dst_key] = float(src_val)
-                    else:
-                        aligned_val = float(src_val) - replay_time_offset_s
-                        if aligned_val >= 0:
-                            entry[dst_key] = aligned_val
+                    aligned_val = float(src_val) - replay_time_offset_s
+                    if aligned_val >= 0:
+                        entry[dst_key] = aligned_val
 
     @staticmethod
     def _fill_missing_official_tyre_life(result):

@@ -305,7 +305,7 @@ class RaceSelectionWindow(QMainWindow):
 
         available_sessions = []
         for s in sessions:
-            session_date_str = session_dates.get(s)
+            session_date_str = get_session_date(s)
             if session_date_str:
                 try:
                     session_dt = datetime.fromisoformat(session_date_str)

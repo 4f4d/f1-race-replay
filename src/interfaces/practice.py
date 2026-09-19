@@ -422,7 +422,7 @@ class PracticeReplay(arcade.Window):
                             anchor_x="center",
                             anchor_y="center"
                         ).draw()
-                        return
+                        comparison_telemetries = comparison_telemetries[:max_keys]
 
                     for idx, comp_tel_data in enumerate(comparison_telemetries):
                         # X position is fixed start + index * width per key
@@ -488,6 +488,40 @@ class PracticeReplay(arcade.Window):
                 current_comparison_tel = {}
                 current_dist = self._pick_telemetry_value(current_tel, "dist")
 
+                # Align comparison laps to the primary lap's track-distance
+                # axis. Frame indexes are not equivalent between laps because
+                # telemetry samples have different counts/timing.
+                primary_dist_axis = np.array([
+                    self._pick_telemetry_value(f.get("telemetry", {}), "rel_dist")
+                    for f in frames
+                ], dtype=float)
+                aligned_comparisons = {}
+                for comp_data in comparison_draw_data:
+                    comp_frames = comp_data["frames"]
+                    comp_dist = np.array([
+                        self._pick_telemetry_value(f.get("telemetry", {}), "rel_dist")
+                        for f in comp_frames
+                    ], dtype=float)
+                    valid = np.isfinite(comp_dist)
+                    if valid.sum() < 2:
+                        aligned_comparisons[comp_data["code"]] = {}
+                        continue
+                    order = np.argsort(comp_dist[valid])
+                    source_dist = comp_dist[valid][order]
+                    source = [comp_frames[i] for i, ok in enumerate(valid) if ok]
+                    source = [source[i] for i in order]
+                    aligned_comparisons[comp_data["code"]] = {
+                        key: np.interp(
+                            primary_dist_axis,
+                            source_dist,
+                            np.array([
+                                self._pick_telemetry_value(f.get("telemetry", {}), key) or 0.0
+                                for f in source
+                            ], dtype=float),
+                        )
+                        for key in ("speed", "throttle", "brake", "gear")
+                    }
+
                 for dz in self.drs_zones:
                     zone_start = dz.get("zone_start")
                     zone_end = dz.get("zone_end")
@@ -545,24 +579,13 @@ class PracticeReplay(arcade.Window):
 
                     # Collect telemetry for all comparison drivers
                     for comp_data in comparison_draw_data:
-                        comp_frames = comp_data["frames"]
-                        if f_i < len(comp_frames):
-                            frame_comp_tel = comp_frames[f_i]
-                            if frame_comp_tel is not None:
-                                frame_comp_tel = frame_comp_tel.get("telemetry", {}) if isinstance(frame_comp_tel.get("telemetry", {}), dict) else {}
-                                c_d = self._pick_telemetry_value(frame_comp_tel, "rel_dist")
-                                c_s = self._pick_telemetry_value(frame_comp_tel, "speed")
-                                c_th = self._pick_telemetry_value(frame_comp_tel, "throttle")
-                                c_br = self._pick_telemetry_value(frame_comp_tel, "brake")
-                                c_gr = self._pick_telemetry_value(frame_comp_tel, "gear")
-                                comp_data["pos"].append(float(c_d) if c_d is not None else None)
-                                comp_data["speeds"].append(float(c_s) if c_s is not None else None)
-                                comp_data["throttle"].append(float(c_th) if c_th is not None else None)
-                                if isinstance(c_br, (bool, int)):
-                                    comp_data["brake"].append(1.0 if c_br else 0.0)
-                                else:
-                                    comp_data["brake"].append(float(c_br) if c_br is not None else None)
-                                comp_data["gears"].append(int(c_gr) if c_gr is not None else None)
+                        aligned = aligned_comparisons.get(comp_data["code"], {})
+                        if aligned:
+                            comp_data["pos"].append(float(d))
+                            comp_data["speeds"].append(float(aligned["speed"][f_i]))
+                            comp_data["throttle"].append(float(aligned["throttle"][f_i]))
+                            comp_data["brake"].append(float(aligned["brake"][f_i]))
+                            comp_data["gears"].append(int(round(aligned["gear"][f_i])))
 
                 # Draw comparison drivers' speed lines
                 if self.show_comparison_telemetry and comparison_draw_data:

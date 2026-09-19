@@ -8,6 +8,38 @@ from src.gui.race_selection import RaceSelectionWindow
 from PySide6.QtWidgets import QApplication
 from src.lib.season import get_season
 import logging
+import re
+
+
+def _extract_circuit_name(event_name: str) -> str:
+    """
+    Extract a reasonable circuit/location name from the F1 event name.
+    Removes common suffixes like 'Grand Prix', 'GP', etc.
+    """
+    if not event_name:
+        return ""
+
+    # Remove common F1 event suffixes
+    suffixes_to_remove = [
+        r'\s+Grand\s+Prix$',
+        r'\s+GP$',
+        r'\s+Grand\s+Prix\s+$',
+        r'\s+GP\s+$',
+    ]
+
+    circuit_name = event_name
+    for suffix in suffixes_to_remove:
+        circuit_name = re.sub(suffix, '', circuit_name, flags=re.IGNORECASE)
+
+    # Trim any extra whitespace
+    circuit_name = circuit_name.strip()
+
+    # If we ended up with an empty string, fall back to the original
+    if not circuit_name:
+        circuit_name = event_name
+
+    return circuit_name
+
 
 def main(year=None, round_number=None, playback_speed=1, session_type='R', visible_hud=True, ready_file=None, show_telemetry_viewer=True):
   print(f"Loading F1 {year} Round {round_number} Session '{session_type}'")
@@ -30,7 +62,7 @@ def main(year=None, round_number=None, playback_speed=1, session_type='R', visib
     # Run the arcade screen showing qualifying results
 
     title = f"{session.event['EventName']} - {'Sprint Qualifying' if session_type == 'SQ' else 'Qualifying Results'}"
-    
+
     run_qualifying_replay(
       session=session,
       data=qualifying_session_data,
@@ -61,7 +93,7 @@ def main(year=None, round_number=None, playback_speed=1, session_type='R', visib
     # Get example lap for track layout
     # Qualifying lap preferred for DRS zones (fallback to fastest race lap (no DRS data))
     example_lap = None
-    
+
     try:
         print("Attempting to load qualifying session for track layout...")
         quali_session = load_session(year, round_number, 'Q')
@@ -90,11 +122,14 @@ def main(year=None, round_number=None, playback_speed=1, session_type='R', visib
     # Get circuit rotation
 
     circuit_rotation = get_circuit_rotation(session)
-    
+
     # Prepare session info for display banner
+    event_name = session.event.get('EventName', '')
+    circuit_name = _extract_circuit_name(event_name)
+
     session_info = {
-        'event_name': session.event.get('EventName', ''),
-        'circuit_name': session.event.get('Location', ''),  # Circuit location/name
+        'event_name': event_name,
+        'circuit_name': circuit_name,
         'country': session.event.get('Country', ''),
         'year': year,
         'round': round_number,
@@ -156,11 +191,11 @@ if __name__ == "__main__":
   else:
     playback_speed = 1
 
-  if "--viewer" in sys.argv:
-  
-    visible_hud = True
-    if "--no-hud" in sys.argv:
-      visible_hud = False
+    if "--viewer" in sys.argv:
+
+      visible_hud = True
+      if "--no-hud" in sys.argv:
+        visible_hud = False
 
     # Session type selection
     if "--sprint-qualifying" in sys.argv:

@@ -1597,12 +1597,17 @@ def get_practice_results(session):
         code = lap['Driver'] # FastF1 usually has Driver as the code (e.g. 'VER')
 
         lap_seconds = lap['LapTime'].total_seconds() if hasattr(lap['LapTime'], 'total_seconds') else None
+        try:
+            driver_info = session.get_driver(code)
+            full_name = driver_info.get('FullName', code)
+        except Exception:
+            full_name = code
         results.append({
             'position': pos,
             'code': code,
             'color': driver_colors.get(code, (128, 128, 128)),
             'time': lap_seconds,
-            'driver_name': lap['Driver'] # Fallback
+            'driver_name': full_name
         })
 
     return results
@@ -1645,13 +1650,23 @@ def get_driver_practice_telemetry(session, session_type=None):
 
             # Prepare data structure for the interface
             frames = []
+            drs_zones = []
+            drs_start = None
             for row in tel.to_dict('records'):
                 session_time = row.get('SessionTime')
                 t = session_time.total_seconds() if hasattr(session_time, 'total_seconds') else row.get('Time', 0.0)
+                brake = row.get('Brake')
+                brake = 100.0 if brake is True else (0.0 if brake is False else brake)
+                drs = row.get('DRS')
+                if drs_start is None and drs is not None and drs >= 10:
+                    drs_start = row.get('Distance')
+                elif drs_start is not None and (drs is None or drs < 10):
+                    drs_zones.append({"zone_start": drs_start, "zone_end": row.get('Distance')})
+                    drs_start = None
                 frames.append({"t": float(t or 0.0), "telemetry": {
                     "x": row.get('X'), "y": row.get('Y'),
                     "speed": row.get('Speed'), "gear": row.get('nGear'),
-                    "throttle": row.get('Throttle'), "brake": row.get('Brake'),
+                    "throttle": row.get('Throttle'), "brake": brake,
                     "drs": row.get('DRS'), "dist": row.get('Distance'),
                     "rel_dist": row.get('RelativeDistance'),
                 }})
@@ -1660,8 +1675,13 @@ def get_driver_practice_telemetry(session, session_type=None):
                 "color": driver_colors.get(driver_code, (128, 128, 128)),
                 "best_lap": {
                         "frames": frames,
+                        "drs_zones": drs_zones,
                         "lap_time": str(best_lap['LapTime']),
-                        "sector_times": best_lap.get_sector_times() if hasattr(best_lap, 'get_sector_times') else {}
+                        "sector_times": {
+                            "Sector1Time": parse_time_string(best_lap.get('Sector1Time')),
+                            "Sector2Time": parse_time_string(best_lap.get('Sector2Time')),
+                            "Sector3Time": parse_time_string(best_lap.get('Sector3Time')),
+                        }
                     }
             }
         except Exception as e:

@@ -1670,6 +1670,10 @@ def get_driver_practice_telemetry(session, session_type=None):
                     "drs": row.get('DRS'), "dist": row.get('Distance'),
                     "rel_dist": row.get('RelativeDistance'),
                 }})
+            # Flush any remaining DRS zone if DRS was active at the end of the lap
+            if drs_start is not None:
+                drs_zones.append({"zone_start": drs_start, "zone_end": row.get('Distance')})
+                drs_start = None
             driver_code = session.get_driver(driver).get("Abbreviation", str(driver))
             telemetry_data[driver_code] = {
                 "color": driver_colors.get(driver_code, (128, 128, 128)),
@@ -1678,9 +1682,9 @@ def get_driver_practice_telemetry(session, session_type=None):
                         "drs_zones": drs_zones,
                         "lap_time": str(best_lap['LapTime']),
                         "sector_times": {
-                            "Sector1Time": parse_time_string(best_lap.get('Sector1Time')),
-                            "Sector2Time": parse_time_string(best_lap.get('Sector2Time')),
-                            "Sector3Time": parse_time_string(best_lap.get('Sector3Time')),
+                            "sector1": parse_time_string(best_lap.get('Sector1Time')),
+                            "sector2": parse_time_string(best_lap.get('Sector2Time')),
+                            "sector3": parse_time_string(best_lap.get('Sector3Time')),
                         }
                     }
             }

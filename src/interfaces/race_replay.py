@@ -382,6 +382,10 @@ class F1RaceReplayWindow(arcade.Window):
                 import fastf1.utils as ffutils
                 from src.lib.tyres import get_tyre_compound_int
                 result = {}
+
+                def _sector_seconds(value):
+                    return float(value.total_seconds()) if pd.notna(value) else None
+
                 for _, row in session.laps.iterrows():
                     code = row.get("Driver")
                     lap_num = row.get("LapNumber")
@@ -421,6 +425,9 @@ class F1RaceReplayWindow(arcade.Window):
                         "line_time_s": float(line_end_s) if line_end_s is not None else None,
                         "tyre": tyre_int,
                         "tyre_life": t_life,
+                        "sector1_s": _sector_seconds(row.get("Sector1Time")),
+                        "sector2_s": _sector_seconds(row.get("Sector2Time")),
+                        "sector3_s": _sector_seconds(row.get("Sector3Time")),
                         "is_pit_entry": is_pit_entry,
                         "is_pit_affected": is_pit_entry,
                         "is_out_lap": is_out_lap,

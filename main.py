@@ -138,6 +138,16 @@ def main(year=None, round_number=None, playback_speed=1, session_type='R', visib
         'circuit_length_m': float(example_lap["Distance"].max()) if example_lap is not None and "Distance" in example_lap else None,
     }
 
+    # Get championship standings before race
+    current_driver_standings, current_constructors_standings = _get_current_championship_standings(session)
+
+    # Compute standings per lap
+    live_driver_standings, live_constructors_standings = get_live_standings(current_driver_standings, current_constructors_standings, session)
+
+    # Launch telemetry viewer if requested
+    if show_telemetry_viewer:
+      launch_telemetry_viewer()
+      print("Launching telemetry stream viewer...")
     # Launch insights menu (always shown with replay)
     launch_insights_menu()
     print("Launching insights menu...")
@@ -158,6 +168,10 @@ def main(year=None, round_number=None, playback_speed=1, session_type='R', visib
       ready_file=ready_file,
       session_info=session_info,
       session=session,
+      current_driver_standings=current_driver_standings,
+      current_constructors_standings=current_constructors_standings,
+      live_driver_standings=live_driver_standings,
+      live_constructors_standings=live_constructors_standings,
       enable_telemetry=True,
       race_control_messages=race_telemetry.get('race_control_messages', [])
     )
@@ -190,10 +204,20 @@ if __name__ == "__main__":
     list_rounds(year)
   elif "--list-sprints" in sys.argv:
     list_sprints(year)
+
+  if "--playback-speed" in sys.argv:
+    speed_index = sys.argv.index("--playback-speed") + 1
+    playback_speed = float(sys.argv[speed_index])
   else:
-    playback_speed = 1
+    playback_speed = 1.0  # Default playback speed
+
 
   if "--viewer" in sys.argv:
+    
+    visible_hud = True
+    if "--no-hud" in sys.argv:
+      visible_hud = False
+
     # Session type selection
     if "--sprint-qualifying" in sys.argv:
       session_type = 'SQ'

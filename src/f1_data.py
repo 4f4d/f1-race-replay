@@ -279,17 +279,68 @@ def _process_single_driver(args):
 
 
 def load_session(year, round_number, session_type="R"):
-    # session_type: 'R' (Race), 'S' (Sprint) etc.
-    session = fastf1.get_session(year, round_number, session_type)
-    session.load(telemetry=True, weather=True)
-    return session
+    # session_type: 'R' (Race), 'S' (Sprint), 'Q' (Qualifying), 'FP1', 'FP2', 'FP3' etc.
+    # Handle cases where 'S' might be incorrect for certain events
+    try:
+        session = fastf1.get_session(year, round_number, session_type)
+        session.load(telemetry=True, weather=True)
+        return session
+    except Exception as e:
+        # Fallback: if 'S' (Sprint) fails, try 'SQ' (Sprint Qualifying) as some events use different codes
+        if session_type == 'S':
+            try:
+                session = fastf1.get_session(year, round_number, 'SQ')
+                session.load(telemetry=True, weather=True)
+                return session
+            except Exception:
+                pass
+        print(f"Error loading session {session_type}: {e}")
+        return None
 
 
 # The following functions require a loaded session object
 
 
 def get_driver_colors(session):
-    color_mapping = fastf1.plotting.get_driver_color_mapping(session)
+    try:
+        color_mapping = fastf1.plotting.get_driver_color_mapping(session)
+    except (AttributeError, KeyError, TypeError) as exc:
+        # FastF1 can fail when its live-timing driver metadata contains a
+        # missing TeamColour. Keep replay rendering functional with stable
+        # fallback colors for those sessions.
+        print(f"Warning: could not load FastF1 driver colors: {exc}")
+        # Team colours used by the current F1 teams. These are only used when
+        # FastF1's live-timing colour metadata is incomplete.
+        team_colors = {
+            "red bull": "#3671C6", "ferrari": "#E80020", "mercedes": "#27F4D2",
+            "mclaren": "#FF8000", "aston martin": "#229971", "alpine": "#FF87BC",
+            "williams": "#64C4FF", "rb": "#6692FF", "racing bulls": "#6692FF",
+            "sauber": "#52E252", "kick sauber": "#52E252", "audi": "#BB0000",
+            "haas": "#B6BABD", "cadillac": "#1E3D73",
+        }
+        fallback = [
+            (230, 0, 0), (0, 120, 255), (255, 170, 0), (0, 190, 120),
+            (180, 80, 220), (255, 105, 180), (130, 130, 130), (255, 255, 0),
+        ]
+        drivers = getattr(session, "drivers", [])
+        color_mapping = {}
+        for index, driver in enumerate(drivers):
+            try:
+                code = session.get_driver(driver)["Abbreviation"]
+            except (KeyError, TypeError, AttributeError):
+                code = str(driver)
+            team = ""
+            try:
+                row = session.results.loc[session.results["Abbreviation"] == code].iloc[0]
+                team = str(row.get("TeamName", "")).lower()
+            except (AttributeError, KeyError, IndexError):
+                pass
+            hex_color = next((value for name, value in team_colors.items() if name in team), None)
+            if hex_color:
+                color_mapping[code] = tuple(int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+            else:
+                color_mapping[code] = fallback[index % len(fallback)]
+        return color_mapping
 
     # Convert hex colors to RGB tuples
     rgb_colors = {}
@@ -1638,3 +1689,129 @@ def list_sprints(year):
     else:
         for _, event in sprints.iterrows():
             print(f"{event['RoundNumber']}: {event['EventName']}")
+
+def get_practice_results(session):
+    """Extract results for practice sessions where official positions might be missing."""
+    enable_cache()
+
+    # Get all laps and find the fastest lap for each driver
+    laps = session.laps
+    driver_fastest = {}
+
+    for _, lap in laps.iterrows():
+        driver = lap['Driver']
+        lap_time = lap['LapTime']
+        if pd.isna(lap_time):
+            continue
+        if driver not in driver_fastest or lap_time < driver_fastest[driver]['LapTime']:
+            driver_fastest[driver] = {
+                'LapTime': lap_time,
+                'lap': lap
+            }
+
+    # Sort drivers by lap time
+    sorted_drivers = sorted(driver_fastest.items(), key=lambda x: x[1]['LapTime'])
+
+    driver_colors = get_driver_colors(session)
+    results = []
+    for pos, (driver, data) in enumerate(sorted_drivers, 1):
+        lap = data['lap']
+        # Use driver code from FastF1
+        code = lap['Driver'] # FastF1 usually has Driver as the code (e.g. 'VER')
+
+        lap_seconds = lap['LapTime'].total_seconds() if hasattr(lap['LapTime'], 'total_seconds') else None
+        try:
+            driver_info = session.get_driver(code)
+            full_name = driver_info.get('FullName', code)
+        except Exception:
+            full_name = code
+        results.append({
+            'position': pos,
+            'code': code,
+            'color': driver_colors.get(code, (128, 128, 128)),
+            'time': lap_seconds,
+            'driver_name': full_name
+        })
+
+    return results
+
+def get_practice_telemetry(session, session_type="FP1"):
+    """Return practice leaderboard data and each driver's fastest-lap telemetry."""
+    results = get_practice_results(session)
+    # Preload every driver's fastest lap so comparison switching is immediate.
+    # The replay still selects the session leader as the initial driver.
+    telemetry = get_driver_practice_telemetry(session)
+    return {"results": results, "telemetry": telemetry}
+
+def get_driver_practice_telemetry(session, session_type=None):
+    """Get fastest-lap telemetry for one driver, or all drivers if omitted."""
+    enable_cache()
+
+    telemetry_data = {}
+    driver_colors = get_driver_colors(session)
+
+    # Iterate through all drivers who had at least one lap
+    session_drivers = list(session.drivers)
+    if session_type and session_type not in session_drivers:
+        drivers = [number for number in session_drivers
+                   if session.get_driver(number).get("Abbreviation") == session_type]
+    else:
+        drivers = session_drivers
+    for driver in drivers:
+        try:
+            # Get fastest lap for this driver
+            driver_laps = session.laps.pick_drivers(driver)
+            if driver_laps.empty:
+                continue
+
+            best_lap = driver_laps.pick_fastest()
+            if best_lap is None:
+                continue
+
+            # Get telemetry for the best lap
+            tel = best_lap.get_telemetry()
+
+            # Prepare data structure for the interface
+            frames = []
+            drs_zones = []
+            drs_start = None
+            for row in tel.to_dict('records'):
+                session_time = row.get('SessionTime')
+                t = session_time.total_seconds() if hasattr(session_time, 'total_seconds') else row.get('Time', 0.0)
+                brake = row.get('Brake')
+                brake = 100.0 if brake is True else (0.0 if brake is False else brake)
+                drs = row.get('DRS')
+                if drs_start is None and drs is not None and drs >= 10:
+                    drs_start = row.get('Distance')
+                elif drs_start is not None and (drs is None or drs < 10):
+                    drs_zones.append({"zone_start": drs_start, "zone_end": row.get('Distance')})
+                    drs_start = None
+                frames.append({"t": float(t or 0.0), "telemetry": {
+                    "x": row.get('X'), "y": row.get('Y'),
+                    "speed": row.get('Speed'), "gear": row.get('nGear'),
+                    "throttle": row.get('Throttle'), "brake": brake,
+                    "drs": row.get('DRS'), "dist": row.get('Distance'),
+                    "rel_dist": row.get('RelativeDistance'),
+                }})
+            # Flush any remaining DRS zone if DRS was active at the end of the lap
+            if drs_start is not None:
+                drs_zones.append({"zone_start": drs_start, "zone_end": row.get('Distance')})
+                drs_start = None
+            driver_code = session.get_driver(driver).get("Abbreviation", str(driver))
+            telemetry_data[driver_code] = {
+                "color": driver_colors.get(driver_code, (128, 128, 128)),
+                "best_lap": {
+                        "frames": frames,
+                        "drs_zones": drs_zones,
+                        "lap_time": str(best_lap['LapTime']),
+                        "sector_times": {
+                            "sector1": parse_time_string(best_lap.get('Sector1Time')),
+                            "sector2": parse_time_string(best_lap.get('Sector2Time')),
+                            "sector3": parse_time_string(best_lap.get('Sector3Time')),
+                        }
+                    }
+            }
+        except Exception as e:
+            print(f"Error getting telemetry for driver {driver}: {e}")
+
+    return telemetry_data

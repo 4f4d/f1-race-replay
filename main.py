@@ -1,17 +1,52 @@
-from src.f1_data import get_race_telemetry, enable_cache, get_circuit_rotation, load_session, get_quali_telemetry, list_rounds, list_sprints, _get_current_championship_standings, get_live_standings
-from src.run_session import run_arcade_replay, launch_telemetry_viewer, launch_insights_menu
+from src.f1_data import get_race_telemetry, enable_cache, get_circuit_rotation, load_session, get_quali_telemetry, get_practice_telemetry, list_rounds, list_sprints
 from src.run_session import run_arcade_replay, launch_insights_menu
 from src.interfaces.qualifying import run_qualifying_replay
+from src.interfaces.practice import run_practice_replay
 import sys
 from src.cli.race_selection import cli_load
 from src.gui.race_selection import RaceSelectionWindow
 from PySide6.QtWidgets import QApplication
 from src.lib.season import get_season
 import logging
+import re
+
+
+def _extract_circuit_name(event_name: str) -> str:
+    """
+    Extract a reasonable circuit/location name from the F1 event name.
+    Removes common suffixes like 'Grand Prix', 'GP', etc.
+    """
+    if not event_name:
+        return ""
+
+    # Remove common F1 event suffixes
+    suffixes_to_remove = [
+        r'\s+Grand\s+Prix$',
+        r'\s+GP$',
+        r'\s+Grand\s+Prix\s+$',
+        r'\s+GP\s+$',
+    ]
+
+    circuit_name = event_name
+    for suffix in suffixes_to_remove:
+        circuit_name = re.sub(suffix, '', circuit_name, flags=re.IGNORECASE)
+
+    # Trim any extra whitespace
+    circuit_name = circuit_name.strip()
+
+    # If we ended up with an empty string, fall back to the original
+    if not circuit_name:
+        circuit_name = event_name
+
+    return circuit_name
+
 
 def main(year=None, round_number=None, playback_speed=1, session_type='R', visible_hud=True, ready_file=None, show_telemetry_viewer=True):
   print(f"Loading F1 {year} Round {round_number} Session '{session_type}'")
   session = load_session(year, round_number, session_type)
+  if session is None:
+    print(f"Unable to load session '{session_type}'.")
+    return
 
   print(f"Loaded session: {session.event['EventName']} - {session.event['RoundNumber']} - {session_type}")
 
@@ -27,10 +62,24 @@ def main(year=None, round_number=None, playback_speed=1, session_type='R', visib
     # Run the arcade screen showing qualifying results
 
     title = f"{session.event['EventName']} - {'Sprint Qualifying' if session_type == 'SQ' else 'Qualifying Results'}"
-    
+
     run_qualifying_replay(
       session=session,
       data=qualifying_session_data,
+      title=title,
+      ready_file=ready_file,
+    )
+
+  elif session_type in ['FP1', 'FP2', 'FP3']:
+    # Get the drivers who participated and their lap times
+    practice_session_data = get_practice_telemetry(session, session_type=session_type)
+
+    # Run the arcade screen showing practice results
+    title = f"{session.event['EventName']} - {session_type} Practice"
+
+    run_practice_replay(
+      session=session,
+      data=practice_session_data,
       title=title,
       ready_file=ready_file,
     )
@@ -44,7 +93,7 @@ def main(year=None, round_number=None, playback_speed=1, session_type='R', visib
     # Get example lap for track layout
     # Qualifying lap preferred for DRS zones (fallback to fastest race lap (no DRS data))
     example_lap = None
-    
+
     try:
         print("Attempting to load qualifying session for track layout...")
         quali_session = load_session(year, round_number, 'Q')
@@ -73,11 +122,14 @@ def main(year=None, round_number=None, playback_speed=1, session_type='R', visib
     # Get circuit rotation
 
     circuit_rotation = get_circuit_rotation(session)
-    
+
     # Prepare session info for display banner
+    event_name = session.event.get('EventName', '')
+    circuit_name = _extract_circuit_name(event_name)
+
     session_info = {
-        'event_name': session.event.get('EventName', ''),
-        'circuit_name': session.event.get('Location', ''),  # Circuit location/name
+        'event_name': event_name,
+        'circuit_name': circuit_name,
         'country': session.event.get('Country', ''),
         'year': year,
         'round': round_number,
@@ -146,6 +198,8 @@ if __name__ == "__main__":
   else:
     round_number = 12  # Default round number
 
+  visible_hud = "--no-hud" not in sys.argv
+
   if "--list-rounds" in sys.argv:
     list_rounds(year)
   elif "--list-sprints" in sys.argv:
@@ -165,7 +219,20 @@ if __name__ == "__main__":
       visible_hud = False
 
     # Session type selection
-    session_type = 'SQ' if "--sprint-qualifying" in sys.argv else ('S' if "--sprint" in sys.argv else ('Q' if "--qualifying" in sys.argv else 'R'))
+    if "--sprint-qualifying" in sys.argv:
+      session_type = 'SQ'
+    elif "--sprint" in sys.argv:
+      session_type = 'S'
+    elif "--qualifying" in sys.argv:
+      session_type = 'Q'
+    elif "--fp1" in sys.argv:
+      session_type = 'FP1'
+    elif "--fp2" in sys.argv:
+      session_type = 'FP2'
+    elif "--fp3" in sys.argv:
+      session_type = 'FP3'
+    else:
+      session_type = 'R'
 
     # Optional ready-file path used when spawned from the GUI to signal ready state
     ready_file = None

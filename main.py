@@ -184,6 +184,8 @@ if __name__ == "__main__":
   else:
     round_number = 12  # Default round number
 
+  visible_hud = "--no-hud" not in sys.argv
+
   if "--list-rounds" in sys.argv:
     list_rounds(year)
   elif "--list-sprints" in sys.argv:
@@ -191,12 +193,7 @@ if __name__ == "__main__":
   else:
     playback_speed = 1
 
-    if "--viewer" in sys.argv:
-
-      visible_hud = True
-      if "--no-hud" in sys.argv:
-        visible_hud = False
-
+  if "--viewer" in sys.argv:
     # Session type selection
     if "--sprint-qualifying" in sys.argv:
       session_type = 'SQ'

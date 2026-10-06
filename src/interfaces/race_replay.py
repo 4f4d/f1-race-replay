@@ -32,8 +32,7 @@ class F1RaceReplayWindow(arcade.Window):
     def __init__(self, frames, track_statuses, example_lap, drivers, title,
                  playback_speed=1.0, driver_colors=None, team_colors=None, circuit_rotation=0.0,
                  left_ui_margin=340, right_ui_margin=260, total_laps=None, visible_hud=True,
-                 session_info=None, session=None, enable_telemetry=False, live_driver_standings=None, current_driver_standings=None, current_constructors_standings=None, live_constructors_standings=None):
-                 session_info=None, session=None, enable_telemetry=False,
+                 session_info=None, session=None, enable_telemetry=False, live_driver_standings=None, current_driver_standings=None, current_constructors_standings=None, live_constructors_standings=None,
                  race_control_messages=None):
         # Set resizable to True so the user can adjust mid-sim
         super().__init__(SCREEN_WIDTH, SCREEN_HEIGHT, title, resizable=True)
@@ -150,7 +149,7 @@ class F1RaceReplayWindow(arcade.Window):
             current_driver_standings=self.current_driver_standings,
             driver_colors=self.driver_colors,
             x=40,
-            y=450,
+            y=550,
             visible=visible_hud
         )
 
@@ -919,6 +918,9 @@ class F1RaceReplayWindow(arcade.Window):
         if self.progress_bar_comp.on_mouse_press(self, x, y, button, modifiers):
             return
         if self.leaderboard_comp.on_mouse_press(self, x, y, button, modifiers):
+            if self.selected_driver:
+                self.show_drivers_championship = False
+                self.show_constructors_championship = False
             return
         if self.legend_comp.on_mouse_press(self, x, y, button, modifiers):
             return

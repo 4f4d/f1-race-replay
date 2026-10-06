@@ -1,5 +1,5 @@
-from src.f1_data import get_race_telemetry, enable_cache, get_circuit_rotation, load_session, get_quali_telemetry, get_practice_telemetry, list_rounds, list_sprints
-from src.run_session import run_arcade_replay, launch_insights_menu
+from src.f1_data import get_race_telemetry, enable_cache, get_circuit_rotation, load_session, get_quali_telemetry, get_practice_telemetry, list_rounds, list_sprints, _get_current_championship_standings, get_live_standings
+from src.run_session import run_arcade_replay, launch_insights_menu, launch_telemetry_viewer
 from src.interfaces.qualifying import run_qualifying_replay
 from src.interfaces.practice import run_practice_replay
 import sys
